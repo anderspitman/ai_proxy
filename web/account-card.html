@@ -1,0 +1,20 @@
+<article class="usage-card" data-usage-account="%%ACCOUNT_ID%%">
+  <div class="usage-account-heading">
+    <strong>%%ACCOUNT_LABEL%%</strong>
+    <span class="status %%ACCOUNT_STATUS_CLASS%%">%%ACCOUNT_STATUS%%</span>
+    %%ACCOUNT_ERROR%%
+  </div>
+  <div class="usage-windows"><span class="empty">Loading current usage…</span></div>
+  <div class="account-fact">
+    <small class="field-label">Port</small>
+    <code>%%ACCOUNT_PORT%%</code>
+  </div>
+  <div class="account-fact last-request">
+    <small class="field-label">Last request</small>
+    %%LAST_REQUEST%%
+  </div>
+  <div class="account-actions actions">
+    <form method="post" action="/accounts/%%ACCOUNT_ID%%/reauth"><button type="submit">Re-auth</button></form>
+    <form method="post" action="/accounts/%%ACCOUNT_ID%%/remove"><button type="submit">Remove</button></form>
+  </div>
+</article>

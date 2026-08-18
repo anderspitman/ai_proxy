@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ai_proxy</title>
+  <style>%%STYLES%%</style>
+</head>
+<body>
+  <main>
+    <h1>ai_proxy</h1>
+    <p>Admin port <code>%%ADMIN_PORT%%</code>, OAuth redirect <code>localhost:%%OAUTH_PORT%%%%OAUTH_PATH%%</code>, downstream range <code>%%PORT_RANGE%%</code>.</p>
+    %%NOTICE%%
+    <section class="panel">
+      <form method="post" action="/accounts" class="actions">
+        <select name="provider">%%PROVIDER_OPTIONS%%</select>
+        <button class="primary" type="submit">Add account</button>
+      </form>
+    </section>
+    <section class="panel" aria-labelledby="usage-title">
+      <div class="section-heading">
+        <h2 id="usage-title">Accounts &amp; usage</h2>
+        <div class="usage-controls">
+          <small id="usage-live-status" aria-live="polite">Connecting live usage updates…</small>
+          <button id="refresh-all-usage" type="button">Sync all usage</button>
+        </div>
+      </div>
+      <div class="usage-grid">%%ACCOUNT_CARDS%%</div>
+    </section>
+  </main>
+  <script>%%SCRIPT%%</script>
+</body>
+</html>

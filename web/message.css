@@ -1,0 +1,8 @@
+body {
+  font-family: ui-sans-serif, system-ui;
+  margin: 40px;
+  line-height: 1.5;
+}
+main { max-width: 760px; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+a { display: inline-block; margin-top: 20px; }

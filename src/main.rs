@@ -1,6 +1,7 @@
 mod config;
 mod convert;
 mod dashboard;
+mod keep_alive;
 mod model;
 
 use std::{
@@ -55,6 +56,7 @@ struct Inner {
     account_servers: Mutex<HashMap<String, AccountServer>>,
     usage_refreshes: Mutex<HashMap<String, Arc<UsageRefresh>>>,
     usage_events: broadcast::Sender<Value>,
+    keep_alive_wake: Notify,
     client: reqwest::Client,
 }
 struct UsageRefresh {
@@ -163,6 +165,7 @@ async fn run() -> std::result::Result<(), String> {
         account_servers: Mutex::new(HashMap::new()),
         usage_refreshes: Mutex::new(HashMap::new()),
         usage_events: usage_event_tx,
+        keep_alive_wake: Notify::new(),
         client: reqwest::Client::builder()
             .build()
             .map_err(|e| e.to_string())?,
@@ -191,6 +194,8 @@ async fn run() -> std::result::Result<(), String> {
             state.schedule_usage_refresh(&account.id).await;
         }
     }
+
+    tokio::spawn(keep_alive::worker(state.clone()));
 
     let oauth_app = Router::new()
         .fallback(any(oauth_request))
@@ -1145,6 +1150,7 @@ impl AppState {
                 .cloned()
                 .ok_or_else(|| AppError::internal("Account disappeared"))?;
             self.schedule_usage_refresh(&account.id).await;
+            self.0.keep_alive_wake.notify_one();
             return Ok(account);
         }
         let mut account = Account {
@@ -1180,6 +1186,7 @@ impl AppState {
                     self.save_db().await?;
                     self.spawn_account(account.id.clone(), listener).await;
                     self.schedule_usage_refresh(&account.id).await;
+                    self.0.keep_alive_wake.notify_one();
                     return Ok(account);
                 }
                 Err(e) => {
@@ -1234,6 +1241,7 @@ impl AppState {
         };
         self.stop_account(&account.id).await;
         self.0.usage_refreshes.lock().await.remove(&account.id);
+        self.0.keep_alive_wake.notify_one();
         self.save_db().await
     }
 }

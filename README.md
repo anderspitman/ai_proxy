@@ -48,9 +48,15 @@ Chat completions is retained for OpenAI-compatible clients that do not support R
 
 The dashboard reads usage from account-scoped snapshots stored in the local JSON database. After a request to a supported `/v1` endpoint finishes, the proxy refreshes only the snapshot for the account serving that request. Concurrent requests for one account are coalesced and serialized without refreshing any other account.
 
-An open dashboard receives snapshot changes over a local SSE connection, so usage charts update without a page refresh. Connecting to the dashboard or its event stream does not contact the provider usage API, and no polling is used. A new account, or an older database without a snapshot, is initialized in the background.
+An open dashboard receives snapshot changes over a local SSE connection, so usage charts update without a page refresh. Connecting to the dashboard or its event stream does not itself contact the provider usage API.
 
 Use **Sync all usage** on the dashboard to explicitly fetch fresh upstream usage for every active account. This is useful when account usage may also be generated outside the proxy; each refreshed account is sent to the page through the same SSE stream.
+
+## Codex window keep alive
+
+The proxy automatically keeps Codex quota windows active for every active account. It sends one minimal `gpt-5.6-luna` request when the proxy starts or discovers a new account, then checks usage every five minutes. If a Codex window expires, its reset timestamp changes, or its available usage increases, the proxy sends one more request and refreshes usage again. Failed keepalive requests are retried at the next check.
+
+This also detects resets and usage caused by other Codex clients or proxy instances. Separate instances may occasionally send duplicate keepalive requests. Keepalives are real upstream requests and consume a small amount of Codex allowance.
 
 ## Command-line options
 

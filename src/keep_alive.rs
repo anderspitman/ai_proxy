@@ -6,15 +6,18 @@ use std::{
 use axum::http::{HeaderValue, Method, StatusCode};
 use futures_util::future::join_all;
 use reqwest::header::HeaderMap as ReqwestHeaders;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{AppError, AppState, Result, log_json, model::Account, read_sse_response};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const RESET_TIMESTAMP_TOLERANCE_SECONDS: u64 = 60;
 const MODEL: &str = "gpt-5.6-luna";
 const PROMPT: &str = "Reply with OK.";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WindowState {
     id: String,
     reset_at: Option<i64>,
@@ -89,6 +92,10 @@ async fn check_account(
 
     state.refresh_usage_and_wait(&account.id).await;
     let Some(mut current) = current_windows(state, &account.id).await else {
+        log_json(
+            json!({"event":"codex_window_keep_alive_check", "accountId":account.id, "triggered":false, "result":"usage_unavailable", "previousWindows":previous}),
+            false,
+        );
         return CheckResult {
             account_id: account.id,
             windows: previous,
@@ -96,7 +103,21 @@ async fn check_account(
         };
     };
 
-    if !reset_detected(&previous, &current, chrono::Utc::now().timestamp()) {
+    let checked_at = chrono::Utc::now().timestamp();
+    let signals = reset_signals(&previous, &current, checked_at);
+    log_json(
+        json!({
+            "event":"codex_window_keep_alive_check",
+            "accountId":account.id,
+            "triggered":!signals.is_empty(),
+            "checkedAt":checked_at,
+            "previousWindows":&previous,
+            "currentWindows":&current,
+            "signals":signals,
+        }),
+        false,
+    );
+    if signals.is_empty() {
         return CheckResult {
             account_id: account.id,
             windows: current,
@@ -257,20 +278,53 @@ fn window_states(windows: &[Value]) -> Vec<WindowState> {
     states
 }
 
-fn reset_detected(previous: &[WindowState], current: &[WindowState], now: i64) -> bool {
+fn reset_signals(previous: &[WindowState], current: &[WindowState], now: i64) -> Vec<Value> {
     let previous: HashMap<_, _> = previous
         .iter()
         .map(|window| (window.id.as_str(), window))
         .collect();
 
-    current.iter().any(|window| {
-        let Some(old) = previous.get(window.id.as_str()) else {
-            return true;
-        };
-        window.reset_at != old.reset_at
-            || window.reset_at.is_some_and(|reset_at| reset_at <= now)
-            || window.remaining_percent > old.remaining_percent + 0.01
-    })
+    current
+        .iter()
+        .filter_map(|window| {
+            let old = previous.get(window.id.as_str()).copied();
+            let mut reasons = Vec::new();
+            if old.is_none() {
+                reasons.push("new_window");
+            }
+            if old.is_some_and(|old| match (old.reset_at, window.reset_at) {
+                (Some(previous), Some(current)) => {
+                    previous.abs_diff(current) > RESET_TIMESTAMP_TOLERANCE_SECONDS
+                }
+                (previous, current) => previous != current,
+            }) {
+                reasons.push("reset_timestamp_changed");
+            }
+            if window.reset_at.is_some_and(|reset_at| reset_at <= now) {
+                reasons.push("reset_deadline_passed");
+            }
+            if old.is_some_and(|old| window.remaining_percent > old.remaining_percent + 0.01) {
+                reasons.push("remaining_usage_increased");
+            }
+            if reasons.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "windowId":window.id,
+                "reasons":reasons,
+                "previousResetAt":old.and_then(|old| old.reset_at),
+                "currentResetAt":window.reset_at,
+                "resetDeltaSeconds":old
+                    .and_then(|old| old.reset_at)
+                    .zip(window.reset_at)
+                    .map(|(previous, current)| current - previous),
+                "previousRemainingPercent":old.map(|old| old.remaining_percent),
+                "currentRemainingPercent":window.remaining_percent,
+                "remainingDelta":old
+                    .map(|old| window.remaining_percent - old.remaining_percent),
+            }))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -291,7 +345,37 @@ mod tests {
             "id":"codex:primary:0", "limitId":"codex", "label":"5-hour window",
             "remainingPercent":60, "resetsAt":2000
         })]);
-        assert!(!reset_detected(&previous, &current, 1000));
+        assert!(reset_signals(&previous, &current, 1000).is_empty());
+    }
+
+    #[test]
+    fn small_reset_timestamp_jitter_is_ignored() {
+        let previous = states(vec![json!({
+            "id":"codex:primary:0", "limitId":"codex", "label":"5-hour window",
+            "remainingPercent":80, "resetsAt":2000
+        })]);
+        for reset_at in [1998, 1999, 2001, 2002, 2060] {
+            let current = states(vec![json!({
+                "id":"codex:primary:0", "limitId":"codex", "label":"5-hour window",
+                "remainingPercent":80, "resetsAt":reset_at
+            })]);
+            assert!(reset_signals(&previous, &current, 1000).is_empty());
+        }
+    }
+
+    #[test]
+    fn meaningful_reset_timestamp_change_is_detected() {
+        let previous = states(vec![json!({
+            "id":"codex:primary:0", "limitId":"codex", "label":"5-hour window",
+            "remainingPercent":80, "resetsAt":2000
+        })]);
+        let current = states(vec![json!({
+            "id":"codex:primary:0", "limitId":"codex", "label":"5-hour window",
+            "remainingPercent":80, "resetsAt":2061
+        })]);
+        let signals = reset_signals(&previous, &current, 1000);
+        assert_eq!(signals[0]["reasons"], json!(["reset_timestamp_changed"]));
+        assert_eq!(signals[0]["resetDeltaSeconds"], 61);
     }
 
     #[test]
@@ -304,8 +388,8 @@ mod tests {
             "id":"codex:primary:0", "limitId":"codex", "label":"5-hour window",
             "remainingPercent":100, "resetsAt":2800
         })]);
-        assert!(reset_detected(&previous, &changed, 900));
-        assert!(reset_detected(&previous, &previous, 1000));
+        assert!(!reset_signals(&previous, &changed, 900).is_empty());
+        assert!(!reset_signals(&previous, &previous, 1000).is_empty());
     }
 
     #[test]
@@ -328,8 +412,8 @@ mod tests {
                 "remainingPercent":100, "resetsAt":3000
             }),
         ]);
-        assert!(reset_detected(&previous, &increased, 1000));
-        assert!(reset_detected(&previous, &added, 1000));
+        assert!(!reset_signals(&previous, &increased, 1000).is_empty());
+        assert!(!reset_signals(&previous, &added, 1000).is_empty());
     }
 
     #[test]

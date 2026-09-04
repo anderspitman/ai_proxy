@@ -143,7 +143,8 @@ Responses.
 - Keep Codex quota windows active automatically for every active account.
 - Send one minimal Codex request when the proxy starts or discovers an account.
 - Poll usage every five minutes and send another request when a Codex window
-  expires, its reset timestamp changes, or its available usage increases.
+  expires, its reset timestamp moves by more than one minute, or its available
+  usage increases.
 - Retry failed keepalive requests on the next poll.
 - Keep comparison and retry state in memory; a restart is handled by the initial
   request, and duplicate requests from separate proxy instances are acceptable.

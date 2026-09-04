@@ -54,7 +54,7 @@ Use **Sync all usage** on the dashboard to explicitly fetch fresh upstream usage
 
 ## Codex window keep alive
 
-The proxy automatically keeps Codex quota windows active for every active account. It sends one minimal `gpt-5.6-luna` request when the proxy starts or discovers a new account, then checks usage every five minutes. If a Codex window expires, its reset timestamp changes, or its available usage increases, the proxy sends one more request and refreshes usage again. Failed keepalive requests are retried at the next check.
+The proxy automatically keeps Codex quota windows active for every active account. It sends one minimal `gpt-5.6-luna` request when the proxy starts or discovers a new account, then checks usage every five minutes. If a Codex window expires, its reset timestamp moves by more than one minute, or its available usage increases, the proxy sends one more request and refreshes usage again. Failed keepalive requests are retried at the next check.
 
 This also detects resets and usage caused by other Codex clients or proxy instances. Separate instances may occasionally send duplicate keepalive requests. Keepalives are real upstream requests and consume a small amount of Codex allowance.
 

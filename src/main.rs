@@ -1534,18 +1534,36 @@ impl AppState {
                 return Err(AppError::internal(e.to_string()));
             }
         };
-        self.0
-            .request_log
-            .finish(pending, Some(status.as_u16()), Some(text.clone()), None);
         if !status.is_success() {
+            self.0
+                .request_log
+                .finish(pending, Some(status.as_u16()), Some(text.clone()), None);
             return Err(AppError::new(
                 status,
                 format!("Usage API returned HTTP {}", status.as_u16()),
             ));
         }
-        let payload: Value = serde_json::from_str(&text).map_err(|_| {
-            AppError::new(StatusCode::BAD_GATEWAY, "Usage API returned invalid JSON")
-        })?;
+        let payload: Value = match serde_json::from_str(&text) {
+            Ok(payload) => payload,
+            Err(_) => {
+                self.0.request_log.finish(
+                    pending,
+                    Some(status.as_u16()),
+                    Some(text),
+                    Some("Usage API returned invalid JSON".into()),
+                );
+                return Err(AppError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "Usage API returned invalid JSON",
+                ));
+            }
+        };
+        // Log the fetch together with its per-window snapshots so each
+        // percentage data point links back to this exact request row.
+        let windows = normalize_usage_windows(&payload);
+        let mut entry = pending.complete(Some(status.as_u16()), Some(text), None);
+        entry.windows = request_log::usage_windows_from_normalized(&windows);
+        self.0.request_log.log(entry);
         Ok((
             payload
                 .get("plan_type")

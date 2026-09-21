@@ -184,9 +184,33 @@ CREATE TABLE upstream_requests (
   response_status INTEGER,
   response_body TEXT,        -- raw JSON or raw SSE text
   duration_ms INTEGER NOT NULL,
-  error TEXT                 -- transport errors and incomplete streams
+  error TEXT,                -- transport errors and incomplete streams
+  model TEXT,                -- parsed from the request (NULL for models/usage)
+  reasoning_effort TEXT,     -- e.g. none, xhigh (NULL for models/usage)
+  input_tokens INTEGER,      -- parsed from response.completed usage
+  output_tokens INTEGER,
+  total_tokens INTEGER,
+  cached_tokens INTEGER,     -- input_tokens_details.cached_tokens
+  reasoning_tokens INTEGER   -- output_tokens_details.reasoning_tokens
+);
+-- One row per usage window per fetch, for all window types the provider
+-- exposes (5-hour, weekly, ...). Join to upstream_requests via request_id.
+CREATE TABLE usage_windows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id INTEGER NOT NULL REFERENCES upstream_requests(id),
+  ts TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  limit_id TEXT NOT NULL,    -- e.g. codex
+  limit_name TEXT,
+  label TEXT NOT NULL,       -- e.g. 5-hour window
+  remaining_percent REAL NOT NULL,
+  resets_at INTEGER
 );
 ```
+
+Cost correlation example: sum `total_tokens` per `model`/`reasoning_effort`
+between two consecutive `usage_windows` readings for an account, divided by
+the `remaining_percent` delta, gives tokens per percentage point over time.
 
 Notes:
 

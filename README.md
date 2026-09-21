@@ -161,3 +161,39 @@ Example:
 ```
 
 Prompts, messages, tool arguments, headers, OAuth tokens, and refresh tokens are not logged.
+
+## Upstream request log
+
+Every upstream provider request (models, responses, chat completions,
+usage, keepalive) is recorded in SQLite (default `./ai_proxy.sqlite3`,
+override with `--request-log` or `ORCHE_PROXY_REQUEST_LOG`). Request and
+response bodies are stored as perfect plaintext copies with no truncation,
+so sessions can be reconstructed and costs reconciled later. Raw SSE text
+is stored for streaming responses.
+
+```sql
+CREATE TABLE upstream_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  kind TEXT NOT NULL,       -- models | responses | chat_completions | usage | keep_alive
+  method TEXT NOT NULL,
+  url TEXT NOT NULL,
+  request_body TEXT,         -- raw JSON, NULL for GETs
+  response_status INTEGER,
+  response_body TEXT,        -- raw JSON or raw SSE text
+  duration_ms INTEGER NOT NULL,
+  error TEXT                 -- transport errors and incomplete streams
+);
+```
+
+Notes:
+
+- Logging is fire-and-forget and never fails a proxied request. SQLite runs
+  in WAL mode so you can query while the proxy is running.
+- If a downstream client disconnects mid-stream, the partial upstream body
+  is still logged with `error = 'incomplete_stream: ...'` so usage/cost
+  reconciliation does not silently miss it.
+- Token refresh and OAuth exchanges are not logged yet.
+- The JSON database remains primary for now; SQLite is an append-only log.

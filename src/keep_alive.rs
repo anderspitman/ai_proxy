@@ -196,9 +196,10 @@ async fn send_keep_alive(state: &AppState, account: &Account) -> Result<()> {
         reqwest::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    let response = state
+    let (response, pending) = state
         .provider_fetch(
             account,
+            "keep_alive",
             path,
             Method::POST,
             headers,
@@ -207,15 +208,36 @@ async fn send_keep_alive(state: &AppState, account: &Account) -> Result<()> {
         )
         .await?;
     let status = response.status();
+    let (events, raw) = match read_sse_response(response).await {
+        Ok((events, raw)) => (events, raw),
+        Err(e) => {
+            state.0.request_log.finish(
+                pending,
+                Some(status.as_u16()),
+                None,
+                Some(e.message.clone()),
+            );
+            return Err(e);
+        }
+    };
+    let raw_body = String::from_utf8_lossy(&raw.body).into_owned();
     if !status.is_success() {
+        state.0.request_log.finish(
+            pending,
+            Some(status.as_u16()),
+            Some(raw_body),
+            Some(format!(
+                "Keepalive request returned HTTP {}",
+                status.as_u16()
+            )),
+        );
         return Err(AppError::new(
             status,
             format!("Keepalive request returned HTTP {}", status.as_u16()),
         ));
     }
-
-    let events = read_sse_response(response).await?;
     let mut completed = false;
+    let mut failed: Option<String> = None;
     for event in events {
         let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
             continue;
@@ -227,23 +249,43 @@ async fn send_keep_alive(state: &AppState, account: &Account) -> Result<()> {
         {
             "response.completed" => completed = true,
             "response.failed" | "response.incomplete" => {
-                return Err(AppError::new(
-                    StatusCode::BAD_GATEWAY,
+                failed = Some(
                     payload
                         .pointer("/error/message")
                         .and_then(Value::as_str)
-                        .unwrap_or("Keepalive response failed"),
-                ));
+                        .unwrap_or("Keepalive response failed")
+                        .to_owned(),
+                );
+                break;
             }
             _ => {}
         }
     }
+    if let Some(message) = failed {
+        state.0.request_log.finish(
+            pending,
+            Some(status.as_u16()),
+            Some(raw_body),
+            Some(message.clone()),
+        );
+        return Err(AppError::new(StatusCode::BAD_GATEWAY, message));
+    }
     if !completed {
+        state.0.request_log.finish(
+            pending,
+            Some(status.as_u16()),
+            Some(raw_body),
+            Some("Keepalive response ended before completion".into()),
+        );
         return Err(AppError::new(
             StatusCode::BAD_GATEWAY,
             "Keepalive response ended before completion",
         ));
     }
+    state
+        .0
+        .request_log
+        .finish(pending, Some(status.as_u16()), Some(raw_body), None);
     Ok(())
 }
 

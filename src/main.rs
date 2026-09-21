@@ -3,12 +3,13 @@ mod convert;
 mod dashboard;
 mod keep_alive;
 mod model;
+mod request_log;
 
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -30,6 +31,7 @@ use model::{
     Account, AccountMetadata, Database, PendingOauth, Tokens, UsageSnapshot, now, parse_time,
 };
 use rand::RngCore;
+use request_log::{PendingLog, RequestLog};
 use reqwest::header::HeaderMap as ReqwestHeaders;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -58,6 +60,7 @@ struct Inner {
     usage_events: broadcast::Sender<Value>,
     keep_alive_wake: Notify,
     client: reqwest::Client,
+    request_log: request_log::RequestLog,
 }
 struct UsageRefresh {
     state: Mutex<UsageRefreshState>,
@@ -155,6 +158,13 @@ async fn run() -> std::result::Result<(), String> {
         Database::empty(config.port_range.start)
     };
     db.normalize(config.port_range.start, &config.default_provider);
+    let request_log_path = config.request_log_path.clone();
+    let request_log = RequestLog::open(request_log_path.clone())
+        .map_err(|e| format!("Failed to open request log: {e}"))?;
+    log_json(
+        json!({"event":"request_log_ready", "path":request_log_path.display().to_string()}),
+        false,
+    );
     let (usage_event_tx, _) = broadcast::channel(128);
     let state = AppState(Arc::new(Inner {
         config,
@@ -169,6 +179,7 @@ async fn run() -> std::result::Result<(), String> {
         client: reqwest::Client::builder()
             .build()
             .map_err(|e| e.to_string())?,
+        request_log,
     }));
 
     let oauth_listener = bind(
@@ -680,9 +691,10 @@ impl AppState {
         } else {
             &provider.api.models_path
         };
-        let upstream = self
+        let (upstream, pending) = self
             .provider_fetch(
                 account,
+                "models",
                 path,
                 Method::GET,
                 ReqwestHeaders::new(),
@@ -692,10 +704,24 @@ impl AppState {
             .await?;
         let status = upstream.status();
         let headers = upstream.headers().clone();
-        let bytes = upstream
-            .bytes()
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
+        let bytes = match upstream.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.0.request_log.finish(
+                    pending,
+                    Some(status.as_u16()),
+                    None,
+                    Some(e.to_string()),
+                );
+                return Err(AppError::internal(e.to_string()));
+            }
+        };
+        self.0.request_log.finish(
+            pending,
+            Some(status.as_u16()),
+            Some(String::from_utf8_lossy(&bytes).into_owned()),
+            None,
+        );
         if !status.is_success() {
             return Ok(raw_response(status, &headers, bytes));
         }
@@ -718,9 +744,10 @@ impl AppState {
                     json!({"error":{"message":"Provider does not expose a Responses endpoint","type":"invalid_request_error"}}),
                 ));
             }
-            let upstream = self
+            let (upstream, pending) = self
                 .provider_fetch(
                     account,
+                    "responses",
                     &provider.api.responses_path,
                     Method::POST,
                     filtered_headers(incoming_headers),
@@ -728,7 +755,7 @@ impl AppState {
                     None,
                 )
                 .await?;
-            return Ok(proxy_response(upstream));
+            return Ok(self.logged_proxy_response(upstream, pending, None));
         }
         let body: Value = serde_json::from_slice(&bytes).map_err(|_| {
             AppError::new(StatusCode::BAD_REQUEST, "Request body must be valid JSON")
@@ -745,9 +772,10 @@ impl AppState {
             reqwest::header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        let upstream = self
+        let (upstream, pending) = self
             .provider_fetch(
                 account,
+                "responses",
                 path,
                 Method::POST,
                 headers,
@@ -756,18 +784,35 @@ impl AppState {
             )
             .await?;
         if !upstream.status().is_success() {
-            return Ok(proxy_response(upstream));
+            return Ok(self.logged_proxy_response(upstream, pending, None));
         }
         if stream {
-            return Ok(proxy_response_with_default(
+            return Ok(self.logged_proxy_response(
                 upstream,
-                "text/event-stream; charset=utf-8",
+                pending,
+                Some("text/event-stream; charset=utf-8"),
             ));
         }
-        let events = read_sse_response(upstream).await?;
-        let response = collect_responses_events(events)
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, e))?;
-        Ok(json_response(StatusCode::OK, response))
+        let (events, raw) = read_sse_response(upstream).await?;
+        let status = raw.status;
+        let raw_body = String::from_utf8_lossy(&raw.body).into_owned();
+        match collect_responses_events(events) {
+            Ok(response) => {
+                self.0
+                    .request_log
+                    .finish(pending, Some(status.as_u16()), Some(raw_body), None);
+                Ok(json_response(StatusCode::OK, response))
+            }
+            Err(e) => {
+                self.0.request_log.finish(
+                    pending,
+                    Some(status.as_u16()),
+                    Some(raw_body),
+                    Some(e.clone()),
+                );
+                Err(AppError::new(StatusCode::BAD_GATEWAY, e))
+            }
+        }
     }
     async fn chat_completions(
         &self,
@@ -782,9 +827,10 @@ impl AppState {
                 .chat_completions_path
                 .as_deref()
                 .unwrap_or("/chat/completions");
-            let upstream = self
+            let (upstream, pending) = self
                 .provider_fetch(
                     account,
+                    "chat_completions",
                     path,
                     Method::POST,
                     filtered_headers(headers),
@@ -792,7 +838,7 @@ impl AppState {
                     None,
                 )
                 .await?;
-            return Ok(proxy_response(upstream));
+            return Ok(self.logged_proxy_response(upstream, pending, None));
         }
         if provider.mode != "responses-adapter" {
             return Err(AppError::internal(format!(
@@ -823,9 +869,10 @@ impl AppState {
             reqwest::header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        let upstream = self
+        let (upstream, pending) = self
             .provider_fetch(
                 account,
+                "chat_completions",
                 path,
                 Method::POST,
                 request_headers,
@@ -834,7 +881,7 @@ impl AppState {
             )
             .await?;
         if !upstream.status().is_success() {
-            return Ok(proxy_response(upstream));
+            return Ok(self.logged_proxy_response(upstream, pending, None));
         }
         let model = chat
             .get("model")
@@ -842,29 +889,47 @@ impl AppState {
             .unwrap_or("unknown")
             .to_owned();
         if chat.get("stream").and_then(Value::as_bool).unwrap_or(false) {
-            Ok(stream_chat_response(upstream, model))
+            Ok(self.logged_chat_stream(upstream, pending, model))
         } else {
-            let events = read_sse_response(upstream).await?;
-            let response = collect_responses_events(events)
-                .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, e))?;
-            Ok(json_response(
-                StatusCode::OK,
-                response_to_chat(&response, &model),
-            ))
+            let (events, raw) = read_sse_response(upstream).await?;
+            let status = raw.status;
+            let raw_body = String::from_utf8_lossy(&raw.body).into_owned();
+            match collect_responses_events(events) {
+                Ok(response) => {
+                    self.0
+                        .request_log
+                        .finish(pending, Some(status.as_u16()), Some(raw_body), None);
+                    Ok(json_response(
+                        StatusCode::OK,
+                        response_to_chat(&response, &model),
+                    ))
+                }
+                Err(e) => {
+                    self.0.request_log.finish(
+                        pending,
+                        Some(status.as_u16()),
+                        Some(raw_body),
+                        Some(e.clone()),
+                    );
+                    Err(AppError::new(StatusCode::BAD_GATEWAY, e))
+                }
+            }
         }
     }
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     async fn provider_fetch(
         &self,
         account: &Account,
+        kind: &str,
         upstream_path: &str,
         method: Method,
         extra: ReqwestHeaders,
         body: Option<Bytes>,
         timeout: Option<Duration>,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<(reqwest::Response, PendingLog)> {
         self.ensure_access_token(&account.id).await?;
         for attempt in 0..2 {
             let current = self
@@ -912,6 +977,21 @@ impl AppState {
                 }
             }
             headers.extend(extra.clone());
+            let ts = now();
+            let start = Instant::now();
+            let request_body = body
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).into_owned());
+            let pending = PendingLog {
+                ts,
+                account_id: current.id.clone(),
+                provider: current.provider.clone(),
+                kind: kind.to_owned(),
+                method: method.as_str().to_owned(),
+                url: url.clone(),
+                request_body,
+                start,
+            };
             let mut request = self.0.client.request(method.clone(), url).headers(headers);
             if let Some(body) = body.clone() {
                 request = request.body(body);
@@ -919,18 +999,27 @@ impl AppState {
             if let Some(timeout) = timeout {
                 request = request.timeout(timeout);
             }
-            let response = request.send().await.map_err(|e| {
-                AppError::new(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Upstream request failed: {e}"),
-                )
-            })?;
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(e) => {
+                    let message = format!("Upstream request failed: {e}");
+                    self.0
+                        .request_log
+                        .finish(pending, None, None, Some(message.clone()));
+                    return Err(AppError::new(StatusCode::BAD_GATEWAY, message));
+                }
+            };
             if response.status() != StatusCode::UNAUTHORIZED
                 || attempt == 1
                 || current.tokens.refresh_token.is_empty()
             {
-                return Ok(response);
+                return Ok((response, pending));
             }
+            // Intermediate 401 that will be retried: log it now; the retry
+            // gets its own row with the full response body.
+            self.0
+                .request_log
+                .finish(pending, Some(StatusCode::UNAUTHORIZED.as_u16()), None, None);
             self.refresh_token(&current.id, true).await?;
         }
         unreachable!()
@@ -1421,9 +1510,10 @@ impl AppState {
             reqwest::header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         );
-        let response = self
+        let (response, pending) = self
             .provider_fetch(
                 account,
+                "usage",
                 &provider.api.usage_url,
                 Method::GET,
                 h,
@@ -1432,10 +1522,21 @@ impl AppState {
             )
             .await?;
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                self.0.request_log.finish(
+                    pending,
+                    Some(status.as_u16()),
+                    None,
+                    Some(e.to_string()),
+                );
+                return Err(AppError::internal(e.to_string()));
+            }
+        };
+        self.0
+            .request_log
+            .finish(pending, Some(status.as_u16()), Some(text.clone()), None);
         if !status.is_success() {
             return Err(AppError::new(
                 status,
@@ -1471,128 +1572,238 @@ fn refresh_usage_after_response(
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
-async fn read_sse_response(response: reqwest::Response) -> Result<Vec<SseEvent>> {
+struct RawSse {
+    status: StatusCode,
+    body: Vec<u8>,
+}
+
+async fn read_sse_response(response: reqwest::Response) -> Result<(Vec<SseEvent>, RawSse)> {
+    let status = response.status();
     let mut stream = response.bytes_stream();
     let mut decoder = SseDecoder::default();
     let mut events = Vec::new();
+    let mut raw = Vec::new();
     while let Some(chunk) = stream.next().await {
-        events.extend(
-            decoder
-                .push(&chunk.map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, e.to_string()))?),
-        );
+        let chunk = chunk.map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+        raw.extend_from_slice(&chunk);
+        events.extend(decoder.push(&chunk));
     }
     if let Some(e) = decoder.finish() {
         events.push(e);
     }
-    Ok(events)
+    Ok((events, RawSse { status, body: raw }))
 }
-fn proxy_response(upstream: reqwest::Response) -> Response {
-    proxy_response_inner(upstream, None)
+
+/// Guard that ensures partial upstream bodies are still logged when a
+/// downstream client disconnects mid-stream. Request bodies are always
+/// complete; only the response may be partial. Partial rows are marked via
+/// the `error` column so cost reconciliation does not silently miss them.
+struct StreamLogGuard {
+    pending: Option<PendingLog>,
+    log: RequestLog,
+    status: u16,
+    buf: Vec<u8>,
+    error: Option<String>,
 }
-fn proxy_response_with_default(
-    upstream: reqwest::Response,
-    content_type: &'static str,
-) -> Response {
-    proxy_response_inner(upstream, Some(content_type))
-}
-fn proxy_response_inner(upstream: reqwest::Response, default: Option<&'static str>) -> Response {
-    let status = upstream.status();
-    let source = upstream.headers().clone();
-    let stream = upstream
-        .bytes_stream()
-        .map(|item| item.map_err(std::io::Error::other));
-    let mut response = Response::new(Body::from_stream(stream));
-    *response.status_mut() = status;
-    copy_response_headers(&source, response.headers_mut());
-    if !response.headers().contains_key(header::CONTENT_TYPE)
-        && let Some(v) = default
-    {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static(v));
+
+impl StreamLogGuard {
+    fn new(pending: PendingLog, log: RequestLog, status: u16) -> Self {
+        Self {
+            pending: Some(pending),
+            log,
+            status,
+            buf: Vec::new(),
+            error: None,
+        }
     }
-    response
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+    fn finish(mut self, error: Option<String>) {
+        if let Some(pending) = self.pending.take() {
+            let body = String::from_utf8_lossy(&self.buf).into_owned();
+            self.log
+                .finish(pending, Some(self.status), Some(body), error);
+        }
+        std::mem::forget(self);
+    }
 }
-fn stream_chat_response(upstream: reqwest::Response, model: String) -> Response {
-    let stream = async_stream::stream! {
-        let id = random_id("chatcmpl");
-        let created = chrono::Utc::now().timestamp();
-        yield Ok::<Bytes, Infallible>(sse_bytes(chat_chunk(
-            &id, created, &model, json!({"role":"assistant"}), Value::Null, None,
-        )));
-        let mut input = upstream.bytes_stream();
-        let mut decoder = SseDecoder::default();
-        let mut tool_indexes = HashMap::<u64, u64>::new();
-        let mut seen_args = HashSet::new();
-        let mut next = 0;
-        let mut saw_tool = false;
-        let mut final_sent = false;
-        while let Some(chunk) = input.next().await {
-            let Ok(chunk) = chunk else { break };
-            for event in decoder.push(&chunk) {
-                let Ok(payload) = serde_json::from_str::<Value>(&event.data) else { continue };
-                let kind = payload.get("type").and_then(Value::as_str).unwrap_or(&event.event);
-                match kind {
-                    "response.output_text.delta" => if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                        yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({"content":delta}), Value::Null, None)));
-                    },
-                    "response.output_item.added" if payload.pointer("/item/type").and_then(Value::as_str) == Some("function_call") => {
-                        let output_index = payload.get("output_index").or_else(||payload.get("index")).and_then(Value::as_u64).unwrap_or(next);
-                        let tool_index = next;
-                        next += 1;
-                        saw_tool = true;
-                        tool_indexes.insert(output_index, tool_index);
-                        yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({"tool_calls":[{
-                            "index":tool_index,
-                            "id":payload.pointer("/item/call_id").or_else(||payload.pointer("/item/id")).cloned().unwrap_or_else(||random_id("call").into()),
-                            "type":"function",
-                            "function":{"name":payload.pointer("/item/name").and_then(Value::as_str).unwrap_or(""),"arguments":""}
-                        }]}), Value::Null, None)));
-                    },
-                    "response.function_call_arguments.delta" => if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                        let output_index = payload.get("output_index").or_else(||payload.get("index")).and_then(Value::as_u64).unwrap_or(0);
-                        let tool_index = *tool_indexes.get(&output_index).unwrap_or(&0);
-                        saw_tool = true;
-                        seen_args.insert(tool_index);
-                        yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({"tool_calls":[{"index":tool_index,"function":{"arguments":delta}}]}), Value::Null, None)));
-                    },
-                    "response.output_item.done" if payload.pointer("/item/type").and_then(Value::as_str) == Some("function_call") => {
-                        let output_index = payload.get("output_index").or_else(||payload.get("index")).and_then(Value::as_u64).unwrap_or(0);
-                        let tool_index = *tool_indexes.get(&output_index).unwrap_or(&0);
-                        saw_tool = true;
-                        if !seen_args.contains(&tool_index)
-                            && let Some(args) = payload.pointer("/item/arguments").and_then(Value::as_str)
-                        {
-                            yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({"tool_calls":[{"index":tool_index,"function":{"arguments":args}}]}), Value::Null, None)));
-                        }
-                    },
-                    "response.completed" => {
-                        let finish = if saw_tool { "tool_calls" } else { "stop" };
-                        yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({}), finish.into(), payload.pointer("/response/usage"))));
-                        final_sent = true;
-                    },
-                    "response.failed" | "response.incomplete" => {
-                        let message = payload.pointer("/error/message").and_then(Value::as_str).unwrap_or("Upstream response failed");
-                        yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({"content":format!("\n[{message}]")}), "stop".into(), None)));
-                        final_sent = true;
-                    },
-                    _ => {},
+
+impl Drop for StreamLogGuard {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            let body = String::from_utf8_lossy(&self.buf).into_owned();
+            let error = self
+                .error
+                .clone()
+                .unwrap_or_else(|| "incomplete_stream: connection closed before completion".into());
+            self.log
+                .finish(pending, Some(self.status), Some(body), Some(error));
+        }
+    }
+}
+
+impl AppState {
+    fn logged_proxy_response(
+        &self,
+        upstream: reqwest::Response,
+        pending: PendingLog,
+        default_content_type: Option<&'static str>,
+    ) -> Response {
+        let status = upstream.status();
+        let source = upstream.headers().clone();
+        let log = self.0.request_log.clone();
+        let stream = async_stream::stream! {
+            let mut guard = StreamLogGuard::new(pending, log, status.as_u16());
+            let mut input = upstream.bytes_stream();
+            while let Some(chunk) = input.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        guard.push(&bytes);
+                        yield Ok::<Bytes, std::io::Error>(bytes);
+                    }
+                    Err(e) => {
+                        let message = format!("Upstream stream failed: {e}");
+                        guard.error = Some(message.clone());
+                        // Log partial body with the transport error.
+                        let mut done = StreamLogGuard {
+                            pending: guard.pending.take(),
+                            log: guard.log.clone(),
+                            status: guard.status,
+                            buf: std::mem::take(&mut guard.buf),
+                            error: None,
+                        };
+                        let body = String::from_utf8_lossy(&done.buf).into_owned();
+                        done.log.finish(
+                            done.pending.take().unwrap(),
+                            Some(done.status),
+                            Some(body),
+                            Some(message.clone()),
+                        );
+                        std::mem::forget(done);
+                        std::mem::forget(guard);
+                        yield Err(std::io::Error::other(message));
+                        return;
+                    }
                 }
             }
+            guard.finish(None);
+        };
+        let mut response = Response::new(Body::from_stream(stream));
+        *response.status_mut() = status;
+        copy_response_headers(&source, response.headers_mut());
+        if !response.headers().contains_key(header::CONTENT_TYPE)
+            && let Some(v) = default_content_type
+        {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static(v));
         }
-        if !final_sent {
-            let finish = if saw_tool { "tool_calls" } else { "stop" };
-            yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({}), finish.into(), None)));
-        }
-        yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
-    };
-    let mut response = Response::new(Body::from_stream(stream));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream; charset=utf-8"),
-    );
-    add_stream_headers(response.headers_mut());
-    response
+        response
+    }
+
+    fn logged_chat_stream(
+        &self,
+        upstream: reqwest::Response,
+        pending: PendingLog,
+        model: String,
+    ) -> Response {
+        let log = self.0.request_log.clone();
+        let upstream_status = upstream.status();
+        let stream = async_stream::stream! {
+            let mut guard = StreamLogGuard::new(pending, log, upstream_status.as_u16());
+            let id = random_id("chatcmpl");
+            let created = chrono::Utc::now().timestamp();
+            yield Ok::<Bytes, Infallible>(sse_bytes(chat_chunk(
+                &id, created, &model, json!({"role":"assistant"}), Value::Null, None,
+            )));
+            let mut input = upstream.bytes_stream();
+            let mut decoder = SseDecoder::default();
+            let mut tool_indexes = HashMap::<u64, u64>::new();
+            let mut seen_args = HashSet::new();
+            let mut next = 0;
+            let mut saw_tool = false;
+            let mut final_sent = false;
+            let mut upstream_failed: Option<String> = None;
+            while let Some(chunk) = input.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        upstream_failed = Some(format!("Upstream stream failed: {e}"));
+                        break;
+                    }
+                };
+                guard.push(&chunk);
+                for event in decoder.push(&chunk) {
+                    let Ok(payload) = serde_json::from_str::<Value>(&event.data) else { continue };
+                    let kind = payload.get("type").and_then(Value::as_str).unwrap_or(&event.event);
+                    match kind {
+                        "response.output_text.delta" => if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                            yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({"content":delta}), Value::Null, None)));
+                        },
+                        "response.output_item.added" if payload.pointer("/item/type").and_then(Value::as_str) == Some("function_call") => {
+                            let output_index = payload.get("output_index").or_else(||payload.get("index")).and_then(Value::as_u64).unwrap_or(next);
+                            let tool_index = next;
+                            next += 1;
+                            saw_tool = true;
+                            tool_indexes.insert(output_index, tool_index);
+                            yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({"tool_calls":[{
+                                "index":tool_index,
+                                "id":payload.pointer("/item/call_id").or_else(||payload.pointer("/item/id")).cloned().unwrap_or_else(||random_id("call").into()),
+                                "type":"function",
+                                "function":{"name":payload.pointer("/item/name").and_then(Value::as_str).unwrap_or(""),"arguments":""}
+                            }]}), Value::Null, None)));
+                        },
+                        "response.function_call_arguments.delta" => if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                            let output_index = payload.get("output_index").or_else(||payload.get("index")).and_then(Value::as_u64).unwrap_or(0);
+                            let tool_index = *tool_indexes.get(&output_index).unwrap_or(&0);
+                            saw_tool = true;
+                            seen_args.insert(tool_index);
+                            yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({"tool_calls":[{"index":tool_index,"function":{"arguments":delta}}]}), Value::Null, None)));
+                        },
+                        "response.output_item.done" if payload.pointer("/item/type").and_then(Value::as_str) == Some("function_call") => {
+                            let output_index = payload.get("output_index").or_else(||payload.get("index")).and_then(Value::as_u64).unwrap_or(0);
+                            let tool_index = *tool_indexes.get(&output_index).unwrap_or(&0);
+                            saw_tool = true;
+                            if !seen_args.contains(&tool_index)
+                                && let Some(args) = payload.pointer("/item/arguments").and_then(Value::as_str)
+                            {
+                                yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({"tool_calls":[{"index":tool_index,"function":{"arguments":args}}]}), Value::Null, None)));
+                            }
+                        },
+                        "response.completed" => {
+                            let finish = if saw_tool { "tool_calls" } else { "stop" };
+                            yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({}), finish.into(), payload.pointer("/response/usage"))));
+                            final_sent = true;
+                        },
+                        "response.failed" | "response.incomplete" => {
+                            let message = payload.pointer("/error/message").and_then(Value::as_str).unwrap_or("Upstream response failed");
+                            yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({"content":format!("\n[{message}]")}), "stop".into(), None)));
+                            final_sent = true;
+                        },
+                        _ => {},
+                    }
+                }
+            }
+            if !final_sent {
+                let finish = if saw_tool { "tool_calls" } else { "stop" };
+                yield Ok(sse_bytes(chat_chunk(&id, created, &model, json!({}), finish.into(), None)));
+            }
+            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+            // Raw upstream SSE is what we store; downstream chat SSE is derived.
+            // A closed stream without completion still logs a partial row via
+            // the guard's error path only when dropped early; here the
+            // upstream ended so this is a complete (possibly empty) body.
+            guard.finish(upstream_failed);
+        };
+        let mut response = Response::new(Body::from_stream(stream));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        add_stream_headers(response.headers_mut());
+        response
+    }
 }
 fn chat_chunk(
     id: &str,

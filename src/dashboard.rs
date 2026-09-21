@@ -138,6 +138,7 @@ mod tests {
             host: "127.0.0.1".into(),
             public_host: "localhost".into(),
             db_path: "test.json".into(),
+            request_log_path: "test.sqlite3".into(),
             port_range: crate::config::PortRange {
                 start: 18001,
                 end: 18100,

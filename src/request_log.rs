@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::model::now;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS upstream_requests (
@@ -115,6 +115,9 @@ impl PendingLog {
         response_body: Option<String>,
         error: Option<String>,
     ) -> StoredEntry {
+        // Bodies are parsed for first-class cost columns, then dropped: only
+        // metadata is persisted for now. Re-enabling raw storage is a one-line
+        // change here (plus keeping the columns, which stay in the schema).
         let parsed = parse_entry(self.request_body.as_deref(), response_body.as_deref());
         StoredEntry {
             ts: self.ts,
@@ -123,9 +126,9 @@ impl PendingLog {
             kind: self.kind,
             method: self.method,
             url: self.url,
-            request_body: self.request_body,
+            request_body: None,
             response_status: response_status.map(i64::from),
-            response_body,
+            response_body: None,
             duration_ms: self.start.elapsed().as_millis() as i64,
             error,
             parsed,
@@ -288,7 +291,8 @@ fn open_and_migrate(path: &PathBuf) -> Result<(rusqlite::Connection, bool), Stri
 }
 
 /// Bring the database to the current schema. Pre-v2 databases are wiped for
-/// a fresh start (no production data exists yet); returns whether a wipe
+/// a fresh start; pre-v3 rows have their raw bodies purged (parsed metadata
+/// is preserved) with a VACUUM to reclaim the space. Returns whether a wipe
 /// happened.
 fn migrate(conn: &rusqlite::Connection) -> Result<bool, String> {
     let version: i64 = conn
@@ -302,7 +306,7 @@ fn migrate(conn: &rusqlite::Connection) -> Result<bool, String> {
         )
         .map(|count| count > 0)
         .map_err(|e| e.to_string())?;
-    let wiped = version < SCHEMA_VERSION && has_table;
+    let wiped = version < 2 && has_table;
     if wiped {
         conn.execute_batch(
             "DROP TABLE IF EXISTS usage_windows; DROP TABLE IF EXISTS upstream_requests;",
@@ -310,6 +314,14 @@ fn migrate(conn: &rusqlite::Connection) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
     }
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+    if version < 3 && has_table && !wiped {
+        conn.execute(
+            "UPDATE upstream_requests SET request_body=NULL, response_body=NULL",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute_batch("VACUUM;").map_err(|e| e.to_string())?;
+    }
     conn.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION}"))
         .map_err(|e| e.to_string())?;
     Ok(wiped)
@@ -455,6 +467,31 @@ CREATE TABLE upstream_requests (
     }
 
     #[test]
+    fn v2_rows_are_purged_of_bodies_but_keep_metadata() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch("PRAGMA user_version=2").unwrap();
+        conn.execute(
+            "INSERT INTO upstream_requests (ts, account_id, provider, kind, method, url, request_body, response_status, response_body, duration_ms, model, input_tokens) VALUES ('t','a','p','responses','POST','u','{big}','200','{huge}',1,'m',5)",
+            [],
+        )
+        .unwrap();
+        assert!(!migrate(&conn).unwrap());
+        let row: (Option<String>, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT request_body, response_body, model, input_tokens FROM upstream_requests",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, Some("m".into()), Some(5)));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
     fn pending_complete_computes_duration() {
         let pending = PendingLog {
             ts: "2026-01-01T00:00:00.000Z".into(),
@@ -469,6 +506,29 @@ CREATE TABLE upstream_requests (
         let entry = pending.complete(Some(200), Some("{}".into()), None);
         assert_eq!(entry.response_status, Some(200));
         assert!(entry.duration_ms >= 0);
+    }
+
+    #[test]
+    fn complete_parses_but_does_not_persist_bodies() {
+        let pending = PendingLog {
+            ts: "t".into(),
+            account_id: "a".into(),
+            provider: "p".into(),
+            kind: "responses".into(),
+            method: "POST".into(),
+            url: "u".into(),
+            request_body: Some(r#"{"model":"gpt-5.5"}"#.into()),
+            start: Instant::now(),
+        };
+        let entry = pending.complete(
+            Some(200),
+            Some("event: done\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n".into()),
+            None,
+        );
+        assert_eq!(entry.request_body, None);
+        assert_eq!(entry.response_body, None);
+        assert_eq!(entry.parsed.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(entry.parsed.total_tokens, Some(7));
     }
 
     #[test]

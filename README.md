@@ -166,10 +166,11 @@ Prompts, messages, tool arguments, headers, OAuth tokens, and refresh tokens are
 
 Every upstream provider request (models, responses, chat completions,
 usage, keepalive) is recorded in SQLite (default `./ai_proxy.sqlite3`,
-override with `--request-log` or `ORCHE_PROXY_REQUEST_LOG`). Request and
-response bodies are stored as perfect plaintext copies with no truncation,
-so sessions can be reconstructed and costs reconciled later. Raw SSE text
-is stored for streaming responses.
+override with `--request-log` or `ORCHE_PROXY_REQUEST_LOG`). Only metadata
+is persisted: routing fields, parsed cost columns, and per-window usage
+snapshots. Raw request/response bodies are parsed in memory and then
+dropped (growth was ~30MB/hour with bodies, versus kilobytes without),
+so costs can be reconciled later without keeping session content.
 
 ```sql
 CREATE TABLE upstream_requests (

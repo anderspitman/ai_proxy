@@ -145,6 +145,9 @@ async fn run() -> std::result::Result<(), String> {
         return Ok(());
     }
     let config = config::load(&cli).await?;
+    if cli.purge_bodies {
+        return purge_request_bodies(&config);
+    }
     let mut db = if tokio::fs::try_exists(&config.db_path)
         .await
         .map_err(|e| e.to_string())?
@@ -254,6 +257,20 @@ async fn run() -> std::result::Result<(), String> {
         );
     }
     tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+fn purge_request_bodies(config: &Config) -> std::result::Result<(), String> {
+    if !std::path::Path::new(&config.request_log_path).exists() {
+        return Err(format!(
+            "Request log not found: {}",
+            config.request_log_path.display()
+        ));
+    }
+    let stats = request_log::purge_bodies(&config.request_log_path)?;
+    println!(
+        "{}",
+        serde_json::json!({"event":"request_bodies_purged", "path":config.request_log_path.display().to_string(), "rowsPurged":stats.rows_purged, "bytesBefore":stats.bytes_before, "bytesAfter":stats.bytes_after})
+    );
     Ok(())
 }
 async fn bind(host: &str, port: u16, label: &str) -> std::result::Result<TcpListener, String> {
@@ -991,6 +1008,7 @@ impl AppState {
                 url: url.clone(),
                 request_body,
                 start,
+                store_bodies: self.0.config.log_bodies,
             };
             let mut request = self.0.client.request(method.clone(), url).headers(headers);
             if let Some(body) = body.clone() {

@@ -106,6 +106,7 @@ pub struct PendingLog {
     pub url: String,
     pub request_body: Option<String>,
     pub start: Instant,
+    pub store_bodies: bool,
 }
 
 impl PendingLog {
@@ -115,10 +116,14 @@ impl PendingLog {
         response_body: Option<String>,
         error: Option<String>,
     ) -> StoredEntry {
-        // Bodies are parsed for first-class cost columns, then dropped: only
-        // metadata is persisted for now. Re-enabling raw storage is a one-line
-        // change here (plus keeping the columns, which stay in the schema).
+        // Bodies are always parsed for first-class cost columns; raw storage
+        // is gated by the log-bodies toggle (off by default).
         let parsed = parse_entry(self.request_body.as_deref(), response_body.as_deref());
+        let (request_body, response_body) = if self.store_bodies {
+            (self.request_body, response_body)
+        } else {
+            (None, None)
+        };
         StoredEntry {
             ts: self.ts,
             account_id: self.account_id,
@@ -126,9 +131,9 @@ impl PendingLog {
             kind: self.kind,
             method: self.method,
             url: self.url,
-            request_body: None,
+            request_body,
             response_status: response_status.map(i64::from),
-            response_body: None,
+            response_body,
             duration_ms: self.start.elapsed().as_millis() as i64,
             error,
             parsed,
@@ -327,6 +332,37 @@ fn migrate(conn: &rusqlite::Connection) -> Result<bool, String> {
     Ok(wiped)
 }
 
+/// One-shot cleanup: NULL out all raw bodies and reclaim the space.
+/// Parsed metadata and usage windows are preserved.
+#[derive(Debug)]
+pub struct PurgeStats {
+    pub rows_purged: i64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+pub fn purge_bodies(path: &std::path::Path) -> Result<PurgeStats, String> {
+    let bytes_before = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+        .map_err(|e| e.to_string())?;
+    migrate(&conn)?;
+    let rows_purged = conn
+        .execute(
+            "UPDATE upstream_requests SET request_body=NULL, response_body=NULL WHERE request_body IS NOT NULL OR response_body IS NOT NULL",
+            [],
+        )
+        .map_err(|e| e.to_string())? as i64;
+    conn.execute_batch("VACUUM;").map_err(|e| e.to_string())?;
+    drop(conn);
+    let bytes_after = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    Ok(PurgeStats {
+        rows_purged,
+        bytes_before,
+        bytes_after,
+    })
+}
+
 fn insert(conn: &rusqlite::Connection, entry: &StoredEntry) -> Result<(), String> {
     conn.execute(
         "INSERT INTO upstream_requests (ts, account_id, provider, kind, method, url, request_body, response_status, response_body, duration_ms, error, model, reasoning_effort, input_tokens, output_tokens, total_tokens, cached_tokens, reasoning_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
@@ -502,10 +538,34 @@ CREATE TABLE upstream_requests (
             url: "https://example.com/models".into(),
             request_body: None,
             start: Instant::now(),
+            store_bodies: false,
         };
         let entry = pending.complete(Some(200), Some("{}".into()), None);
         assert_eq!(entry.response_status, Some(200));
         assert!(entry.duration_ms >= 0);
+    }
+
+    #[test]
+    fn bodies_persisted_only_when_toggle_is_on() {
+        let sse = "event: done\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n";
+        for store_bodies in [false, true] {
+            let pending = PendingLog {
+                ts: "t".into(),
+                account_id: "a".into(),
+                provider: "p".into(),
+                kind: "responses".into(),
+                method: "POST".into(),
+                url: "u".into(),
+                request_body: Some(r#"{"model":"gpt-5.5"}"#.into()),
+                start: Instant::now(),
+                store_bodies,
+            };
+            let entry = pending.complete(Some(200), Some(sse.into()), None);
+            assert_eq!(entry.request_body.is_some(), store_bodies);
+            assert_eq!(entry.response_body.is_some(), store_bodies);
+            assert_eq!(entry.parsed.model.as_deref(), Some("gpt-5.5"));
+            assert_eq!(entry.parsed.total_tokens, Some(7));
+        }
     }
 
     #[test]
@@ -519,6 +579,7 @@ CREATE TABLE upstream_requests (
             url: "u".into(),
             request_body: Some(r#"{"model":"gpt-5.5"}"#.into()),
             start: Instant::now(),
+            store_bodies: false,
         };
         let entry = pending.complete(
             Some(200),
@@ -529,6 +590,39 @@ CREATE TABLE upstream_requests (
         assert_eq!(entry.response_body, None);
         assert_eq!(entry.parsed.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(entry.parsed.total_tokens, Some(7));
+    }
+
+    #[test]
+    fn purge_bodies_clears_and_shrinks() {
+        let path = std::env::temp_dir().join(format!(
+            "ai_proxy_purge_test_{}_{}.sqlite3",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        migrate(&conn).unwrap();
+        let big = "x".repeat(300_000);
+        conn.execute(
+            "INSERT INTO upstream_requests (ts, account_id, provider, kind, method, url, request_body, response_body, duration_ms) VALUES ('t','a','p','k','GET','u',?1,?2,1)",
+            rusqlite::params![big, big],
+        )
+        .unwrap();
+        drop(conn);
+        let stats = purge_bodies(&path).unwrap();
+        assert_eq!(stats.rows_purged, 1);
+        assert!(stats.bytes_after < stats.bytes_before);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM upstream_requests WHERE request_body IS NOT NULL OR response_body IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -18,6 +18,8 @@ pub struct Cli {
     pub public_host: String,
     pub db_path: PathBuf,
     pub request_log_path: Option<PathBuf>,
+    pub log_bodies: bool,
+    pub purge_bodies: bool,
     pub config_path: PathBuf,
     pub port_range: PortRange,
     pub provider: String,
@@ -38,6 +40,7 @@ pub struct Config {
     pub public_host: String,
     pub db_path: PathBuf,
     pub request_log_path: PathBuf,
+    pub log_bodies: bool,
     pub port_range: PortRange,
     pub default_provider: String,
     pub providers: HashMap<String, Provider>,
@@ -113,6 +116,8 @@ pub fn parse_args() -> Result<Cli, String> {
             .map(PathBuf::from)
             .unwrap_or_else(|| cwd.join("orche-proxy.db.json")),
         request_log_path: env::var_os("ORCHE_PROXY_REQUEST_LOG").map(PathBuf::from),
+        log_bodies: env_flag("ORCHE_PROXY_LOG_BODIES"),
+        purge_bodies: false,
         config_path: env::var_os("ORCHE_PROXY_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| cwd.join("orche-proxy.config.json")),
@@ -129,6 +134,27 @@ pub fn parse_args() -> Result<Cli, String> {
         if arg == "--help" || arg == "-h" {
             cli.help = true;
             i += 1;
+            continue;
+        }
+        // Bare boolean flags: `--log-bodies` / `--purge-bodies` with no value
+        // mean true; an explicit true/false value is also accepted.
+        if arg == "--log-bodies" || arg == "--purge-bodies" {
+            let flag = match args.get(i + 1) {
+                Some(next) if !next.starts_with("--") => {
+                    let value = parse_flag(next, arg)?;
+                    i += 2;
+                    value
+                }
+                _ => {
+                    i += 1;
+                    true
+                }
+            };
+            if arg == "--log-bodies" {
+                cli.log_bodies = flag;
+            } else {
+                cli.purge_bodies = flag;
+            }
             continue;
         }
         let value = args
@@ -160,6 +186,16 @@ pub fn parse_args() -> Result<Cli, String> {
     Ok(cli)
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name).is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+fn parse_flag(value: &str, label: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => Err(format!("{label} expects true or false")),
+    }
+}
 fn env_port(name: &str, fallback: u16) -> Result<u16, String> {
     match env::var(name) {
         Ok(value) => parse_port(&value, name),
@@ -240,6 +276,7 @@ pub async fn load(cli: &Cli) -> Result<Config, String> {
         public_host: cli.public_host.clone(),
         db_path: cli.db_path.clone(),
         request_log_path,
+        log_bodies: cli.log_bodies,
         port_range: cli.port_range,
         default_provider: cli.provider.clone(),
         providers: typed,
@@ -282,5 +319,5 @@ fn default_providers() -> Value {
 }
 
 pub fn help() -> &'static str {
-    "Usage: ai_proxy [options]\n\nOptions:\n  --admin-port <port>     Admin dashboard port (default: 17800)\n  --oauth-port <port>     OAuth redirect port (default: 1455)\n  --port-range <a-b>      Downstream account port range (default: 18001-18100)\n  --host <host>           Bind host for local servers (default: 127.0.0.1)\n  --public-host <host>    Host shown in dashboard URLs (default: localhost)\n  --db <file>             JSON database path (default: ./orche-proxy.db.json)\n  --request-log <file>    SQLite upstream request log (default: ./ai_proxy.sqlite3)\n  --config <file>         Optional provider config JSON path\n  --provider <id>         Default provider for new accounts (default: chatgpt)\n  --help                  Show this help\n\nEnvironment variables use the ORCHE_PROXY_* equivalents.\n"
+    "Usage: ai_proxy [options]\n\nOptions:\n  --admin-port <port>     Admin dashboard port (default: 17800)\n  --oauth-port <port>     OAuth redirect port (default: 1455)\n  --port-range <a-b>      Downstream account port range (default: 18001-18100)\n  --host <host>           Bind host for local servers (default: 127.0.0.1)\n  --public-host <host>    Host shown in dashboard URLs (default: localhost)\n  --db <file>             JSON database path (default: ./orche-proxy.db.json)\n  --request-log <file>    SQLite upstream request log (default: ./ai_proxy.sqlite3)\n  --log-bodies [bool]     Persist raw request/response bodies (default: false)\n  --purge-bodies          Delete stored bodies from the SQLite log and exit\n  --config <file>         Optional provider config JSON path\n  --provider <id>         Default provider for new accounts (default: chatgpt)\n  --help                  Show this help\n\nEnvironment variables use the ORCHE_PROXY_* equivalents.\n"
 }

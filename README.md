@@ -213,6 +213,23 @@ Cost correlation example: sum `total_tokens` per `model`/`reasoning_effort`
 between two consecutive `usage_windows` readings for an account, divided by
 the `remaining_percent` delta, gives tokens per percentage point over time.
 
+## Debugging with bodies
+
+Raw bodies are off by default. To capture them temporarily (e.g. diffing
+request prefixes to diagnose cache misses):
+
+```sh
+ai_proxy --log-bodies          # or ORCHE_PROXY_LOG_BODIES=1
+```
+
+Clean up afterwards with:
+
+```sh
+ai_proxy --purge-bodies        # NULLs all bodies, VACUUMs, prints stats
+```
+
+Parsed metadata and usage windows are preserved by the purge.
+
 Notes:
 
 - Logging is fire-and-forget and never fails a proxied request. SQLite runs

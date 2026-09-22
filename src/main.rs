@@ -784,11 +784,7 @@ impl AppState {
         } else {
             &provider.api.responses_path
         };
-        let mut headers = ReqwestHeaders::new();
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
+        let headers = adapter_headers(incoming_headers, &user_agent(&provider));
         let (upstream, pending) = self
             .provider_fetch(
                 account,
@@ -881,11 +877,7 @@ impl AppState {
         } else {
             &provider.api.responses_path
         };
-        let mut request_headers = ReqwestHeaders::new();
-        request_headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
+        let request_headers = adapter_headers(headers, &user_agent(&provider));
         let (upstream, pending) = self
             .provider_fetch(
                 account,
@@ -1882,6 +1874,14 @@ fn copy_response_headers(from: &ReqwestHeaders, to: &mut HeaderMap) {
         HeaderValue::from_static("*"),
     );
 }
+/// Downstream headers safe to forward upstream: everything except hop-by-hop
+/// transport headers and per-request identity. `authorization`, `host` and
+/// `content-length` are always stripped here and re-applied from account
+/// state by `provider_fetch`, so a downstream client can never override the
+/// account token. Ambient browser/proxy state (`cookie`, `forwarded`,
+/// `x-forwarded-*`) and the account-bound `chatgpt-account-id` header are
+/// stripped for the same reason. Everything else (session/cache affinity
+/// headers, client request ids, beta flags, …) passes through untouched.
 fn filtered_headers(from: &HeaderMap) -> ReqwestHeaders {
     let mut out = ReqwestHeaders::new();
     for (k, v) in from {
@@ -1889,9 +1889,38 @@ fn filtered_headers(from: &HeaderMap) -> ReqwestHeaders {
             && k != header::AUTHORIZATION
             && k != header::HOST
             && k != header::CONTENT_LENGTH
+            && k != header::COOKIE
+            && !sensitive_header(k.as_str())
         {
             out.insert(k.clone(), v.clone());
         }
+    }
+    out
+}
+/// Headers that must never be forwarded from downstream: the account-bound
+/// identity header (re-applied from account metadata in `provider_fetch`)
+/// and proxy-level client network labels.
+fn sensitive_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "chatgpt-account-id" || lower == "forwarded" || lower.starts_with("x-forwarded-")
+}
+/// Upstream headers for the `responses-adapter` branches: transparent to
+/// downstream application headers (session/cache affinity, client request
+/// ids, beta flags), with the normalized JSON body content type forced and
+/// the user-agent falling back to the configured provider value when the
+/// downstream client did not send one. Auth and account identity are still
+/// applied on top by `provider_fetch`, so they can never come from
+/// downstream.
+fn adapter_headers(from: &HeaderMap, fallback_user_agent: &str) -> ReqwestHeaders {
+    let mut out = filtered_headers(from);
+    out.insert(
+        reqwest::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if !out.contains_key(reqwest::header::USER_AGENT)
+        && let Ok(ua) = HeaderValue::from_str(fallback_user_agent)
+    {
+        out.insert(reqwest::header::USER_AGENT, ua);
     }
     out
 }
@@ -2246,5 +2275,155 @@ fn usage_label(seconds: Option<f64>, fallback: &str) -> String {
         format!("{}-minute window", s / 60)
     } else {
         format!("{s}-second window")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn incoming(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(
+                HeaderName::try_from(*k).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        map
+    }
+
+    fn value(headers: &ReqwestHeaders, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn adapter_preserves_session_affinity_headers() {
+        let from = incoming(&[
+            ("session-id", "sess-1"),
+            ("thread-id", "thread-9"),
+            ("x-client-request-id", "req-123"),
+            ("openai-beta", "responses-v2"),
+            ("originator", "some-client"),
+            ("x-custom-app-header", "kept"),
+        ]);
+        let out = adapter_headers(&from, "proxy-ua/1.0");
+        assert_eq!(value(&out, "session-id").as_deref(), Some("sess-1"));
+        assert_eq!(value(&out, "thread-id").as_deref(), Some("thread-9"));
+        assert_eq!(
+            value(&out, "x-client-request-id").as_deref(),
+            Some("req-123")
+        );
+        assert_eq!(value(&out, "openai-beta").as_deref(), Some("responses-v2"));
+        assert_eq!(value(&out, "originator").as_deref(), Some("some-client"));
+        assert_eq!(value(&out, "x-custom-app-header").as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn adapter_strips_auth_transport_and_ambient_headers() {
+        let from = incoming(&[
+            ("authorization", "Bearer downstream"),
+            ("host", "downstream.local"),
+            ("content-length", "42"),
+            ("cookie", "session=abc"),
+            ("connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("keep-alive", "timeout=5"),
+            ("forwarded", "for=1.2.3.4"),
+            ("x-forwarded-for", "1.2.3.4"),
+            ("x-forwarded-proto", "https"),
+            ("chatgpt-account-id", "downstream-account"),
+            ("session-id", "sess-1"),
+        ]);
+        let out = adapter_headers(&from, "proxy-ua/1.0");
+        for name in [
+            "authorization",
+            "host",
+            "content-length",
+            "cookie",
+            "connection",
+            "transfer-encoding",
+            "keep-alive",
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "chatgpt-account-id",
+        ] {
+            assert!(out.get(name).is_none(), "{name} must not be forwarded");
+        }
+        // Unrelated application headers still pass through.
+        assert_eq!(value(&out, "session-id").as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn adapter_strips_mixed_case_account_and_forwarded_headers() {
+        let from = incoming(&[
+            ("ChatGPT-Account-Id", "downstream-account"),
+            ("X-Forwarded-Host", "evil.local"),
+        ]);
+        let out = adapter_headers(&from, "proxy-ua/1.0");
+        assert!(out.get("chatgpt-account-id").is_none());
+        assert!(out.get("x-forwarded-host").is_none());
+    }
+
+    #[test]
+    fn downstream_auth_cannot_override_account_token() {
+        // Mirrors the merge order in `provider_fetch`: account credentials
+        // are inserted first, then the adapter headers are extended on top.
+        // Because the adapter output never contains these keys, the account
+        // values always survive.
+        let from = incoming(&[
+            ("authorization", "Bearer downstream"),
+            ("chatgpt-account-id", "downstream-account"),
+            ("session-id", "sess-1"),
+        ]);
+        let mut merged = ReqwestHeaders::new();
+        merged.insert(
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer account-token"),
+        );
+        merged.insert(
+            HeaderName::from_static("chatgpt-account-id"),
+            HeaderValue::from_static("account-7"),
+        );
+        merged.extend(adapter_headers(&from, "proxy-ua/1.0"));
+        assert_eq!(
+            value(&merged, "authorization").as_deref(),
+            Some("Bearer account-token")
+        );
+        assert_eq!(
+            value(&merged, "chatgpt-account-id").as_deref(),
+            Some("account-7")
+        );
+    }
+
+    #[test]
+    fn client_user_agent_is_preferred() {
+        let from = incoming(&[("user-agent", "downstream-client/2.0")]);
+        let out = adapter_headers(&from, "proxy-ua/1.0");
+        assert_eq!(
+            value(&out, "user-agent").as_deref(),
+            Some("downstream-client/2.0")
+        );
+    }
+
+    #[test]
+    fn proxy_user_agent_is_fallback() {
+        let from = incoming(&[("session-id", "sess-1")]);
+        let out = adapter_headers(&from, "proxy-ua/1.0");
+        assert_eq!(value(&out, "user-agent").as_deref(), Some("proxy-ua/1.0"));
+    }
+
+    #[test]
+    fn adapter_forces_json_content_type() {
+        let from = incoming(&[("content-type", "text/plain")]);
+        let out = adapter_headers(&from, "proxy-ua/1.0");
+        assert_eq!(
+            value(&out, "content-type").as_deref(),
+            Some("application/json")
+        );
     }
 }

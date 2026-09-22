@@ -311,7 +311,7 @@ fn default_providers() -> Value {
             }
         },
         "api": {
-            "baseUrl": "https://chatgpt.com/backend-api/codex", "modelsPath": "/models?client_version=0.142.5",
+            "baseUrl": "https://chatgpt.com/backend-api/codex", "modelsPath": "/models?client_version=0.153.0",
             "responsesPath": "/responses", "usageUrl": "https://chatgpt.com/backend-api/wham/usage",
             "chatCompletionsPath": null, "userAgent": format!("{APP_NAME}/{APP_VERSION}"), "headers": {}
         }
@@ -320,4 +320,77 @@ fn default_providers() -> Value {
 
 pub fn help() -> &'static str {
     "Usage: ai_proxy [options]\n\nOptions:\n  --admin-port <port>     Admin dashboard port (default: 17800)\n  --oauth-port <port>     OAuth redirect port (default: 1455)\n  --port-range <a-b>      Downstream account port range (default: 18001-18100)\n  --host <host>           Bind host for local servers (default: 127.0.0.1)\n  --public-host <host>    Host shown in dashboard URLs (default: localhost)\n  --db <file>             JSON database path (default: ./orche-proxy.db.json)\n  --request-log <file>    SQLite upstream request log (default: ./ai_proxy.sqlite3)\n  --log-bodies [bool]     Persist raw request/response bodies (default: false)\n  --purge-bodies          Delete stored bodies from the SQLite log and exit\n  --config <file>         Optional provider config JSON path\n  --provider <id>         Default provider for new accounts (default: chatgpt)\n  --help                  Show this help\n\nEnvironment variables use the ORCHE_PROXY_* equivalents.\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_models_path_uses_current_client_version() {
+        // Pinned to the Codex CLI version in /tmp/codex-cli: its bundled
+        // model catalog (codex-rs/models-manager/models.json) lists
+        // gpt-5.6-sol with minimal_client_version 0.144.0 and peaks at
+        // 0.153.0, matching the 0.153.0 CLI in-tree. An older pin (e.g.
+        // 0.142.5) makes the backend omit current models.
+        let path = default_providers()
+            .pointer("/chatgpt/api/modelsPath")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(path, "/models?client_version=0.153.0");
+    }
+
+    fn test_cli(dir: &Path, config_path: PathBuf) -> Cli {
+        Cli {
+            admin_port: 17800,
+            oauth_port: 1455,
+            host: "127.0.0.1".into(),
+            public_host: "localhost".into(),
+            db_path: dir.join("db.json"),
+            request_log_path: None,
+            log_bodies: false,
+            purge_bodies: false,
+            config_path,
+            port_range: PortRange {
+                start: 18001,
+                end: 18100,
+            },
+            provider: "chatgpt".into(),
+            help: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn config_file_override_still_wins() {
+        let dir = std::env::temp_dir().join(format!("ai_proxy_cfg_{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let config_path = dir.join("override.json");
+        tokio::fs::write(
+            &config_path,
+            r#"{"providers":{"chatgpt":{"api":{"modelsPath":"/models?client_version=9.9.9"}}}}"#,
+        )
+        .await
+        .unwrap();
+        let config = load(&test_cli(&dir, config_path)).await.unwrap();
+        assert_eq!(
+            config.providers["chatgpt"].api.models_path,
+            "/models?client_version=9.9.9"
+        );
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn missing_config_file_keeps_defaults() {
+        let dir = std::env::temp_dir().join(format!("ai_proxy_cfg_{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let config = load(&test_cli(&dir, dir.join("absent.json")))
+            .await
+            .unwrap();
+        assert_eq!(
+            config.providers["chatgpt"].api.models_path,
+            "/models?client_version=0.153.0"
+        );
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
 }

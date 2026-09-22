@@ -192,7 +192,9 @@ CREATE TABLE upstream_requests (
   output_tokens INTEGER,
   total_tokens INTEGER,
   cached_tokens INTEGER,     -- input_tokens_details.cached_tokens
-  reasoning_tokens INTEGER   -- output_tokens_details.reasoning_tokens
+  reasoning_tokens INTEGER,  -- output_tokens_details.reasoning_tokens
+  prompt_cache_key TEXT,     -- client session key, stable across a session
+  cache_write_tokens INTEGER -- input_tokens_details.cache_write_tokens
 );
 -- One row per usage window per fetch, for all window types the provider
 -- exposes (5-hour, weekly, ...). Join to upstream_requests via request_id.

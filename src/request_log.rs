@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::model::now;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS upstream_requests (
@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS upstream_requests (
   output_tokens INTEGER,
   total_tokens INTEGER,
   cached_tokens INTEGER,
-  reasoning_tokens INTEGER
+  reasoning_tokens INTEGER,
+  prompt_cache_key TEXT,
+  cache_write_tokens INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_upstream_requests_account_ts ON upstream_requests(account_id, ts);
 CREATE INDEX IF NOT EXISTS idx_upstream_requests_ts ON upstream_requests(ts);
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS usage_windows (
   resets_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_usage_windows_account_ts ON usage_windows(account_id, ts);
+CREATE INDEX IF NOT EXISTS idx_upstream_requests_cache_key ON upstream_requests(prompt_cache_key);
 "#;
 
 /// First-class cost attribution parsed out of the raw bodies. Everything is
@@ -58,6 +61,8 @@ pub struct Parsed {
     pub total_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
+    pub prompt_cache_key: Option<String>,
+    pub cache_write_tokens: Option<i64>,
 }
 
 /// One usage window snapshot. All window types (5-hour, weekly, and whatever
@@ -152,6 +157,9 @@ fn parse_entry(request_body: Option<&str>, response_body: Option<&str>) -> Parse
             out.model = Some(model.to_owned());
         }
         out.reasoning_effort = crate::convert::reasoning_effort(&value);
+        if let Some(key) = value.get("prompt_cache_key").and_then(Value::as_str) {
+            out.prompt_cache_key = Some(key.to_owned());
+        }
     }
     if let Some(body) = response_body {
         // Raw SSE: the last response.completed event carries the final usage.
@@ -180,6 +188,9 @@ fn parse_entry(request_body: Option<&str>, response_body: Option<&str>) -> Parse
                 .and_then(as_i64);
             out.reasoning_tokens = usage
                 .pointer("/output_tokens_details/reasoning_tokens")
+                .and_then(as_i64);
+            out.cache_write_tokens = usage
+                .pointer("/input_tokens_details/cache_write_tokens")
                 .and_then(as_i64);
         }
     }
@@ -318,6 +329,31 @@ fn migrate(conn: &rusqlite::Connection) -> Result<bool, String> {
         )
         .map_err(|e| e.to_string())?;
     }
+    // v4: additive cost columns; existing rows keep their data and get NULLs.
+    // Runs before SCHEMA so the new index has its column.
+    if (2..4).contains(&version) && has_table {
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(upstream_requests)")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .and_then(|rows| rows.collect())
+            })
+            .map_err(|e| e.to_string())?;
+        for (name, ddl) in [
+            (
+                "prompt_cache_key",
+                "ALTER TABLE upstream_requests ADD COLUMN prompt_cache_key TEXT",
+            ),
+            (
+                "cache_write_tokens",
+                "ALTER TABLE upstream_requests ADD COLUMN cache_write_tokens INTEGER",
+            ),
+        ] {
+            if !columns.iter().any(|c| c == name) {
+                conn.execute_batch(ddl).map_err(|e| e.to_string())?;
+            }
+        }
+    }
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
     if version < 3 && has_table && !wiped {
         conn.execute(
@@ -365,7 +401,7 @@ pub fn purge_bodies(path: &std::path::Path) -> Result<PurgeStats, String> {
 
 fn insert(conn: &rusqlite::Connection, entry: &StoredEntry) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO upstream_requests (ts, account_id, provider, kind, method, url, request_body, response_status, response_body, duration_ms, error, model, reasoning_effort, input_tokens, output_tokens, total_tokens, cached_tokens, reasoning_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        "INSERT INTO upstream_requests (ts, account_id, provider, kind, method, url, request_body, response_status, response_body, duration_ms, error, model, reasoning_effort, input_tokens, output_tokens, total_tokens, cached_tokens, reasoning_tokens, prompt_cache_key, cache_write_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         rusqlite::params![
             entry.ts,
             entry.account_id,
@@ -385,6 +421,8 @@ fn insert(conn: &rusqlite::Connection, entry: &StoredEntry) -> Result<(), String
             entry.parsed.total_tokens,
             entry.parsed.cached_tokens,
             entry.parsed.reasoning_tokens,
+            entry.parsed.prompt_cache_key,
+            entry.parsed.cache_write_tokens,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -626,13 +664,41 @@ CREATE TABLE upstream_requests (
     }
 
     #[test]
+    fn v3_databases_gain_new_columns_without_losing_data() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE upstream_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, account_id TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL, method TEXT NOT NULL, url TEXT NOT NULL, request_body TEXT, response_status INTEGER, response_body TEXT, duration_ms INTEGER NOT NULL, error TEXT, model TEXT, reasoning_effort TEXT, input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER);
+            CREATE TABLE usage_windows (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL, ts TEXT NOT NULL, account_id TEXT NOT NULL, limit_id TEXT NOT NULL, limit_name TEXT, label TEXT NOT NULL, remaining_percent REAL NOT NULL, resets_at INTEGER);",
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA user_version=3").unwrap();
+        conn.execute(
+            "INSERT INTO upstream_requests (ts, account_id, provider, kind, method, url, duration_ms, model) VALUES ('t','a','p','k','GET','u',1,'m')",
+            [],
+        )
+        .unwrap();
+        assert!(!migrate(&conn).unwrap());
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT model, prompt_cache_key FROM upstream_requests",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("m".into(), None));
+    }
+
+    #[test]
     fn parses_model_and_reasoning_effort_from_request() {
         let parsed = parse_entry(
-            Some(r#"{"model":"gpt-5.5","reasoning":{"effort":"xhigh"}}"#),
+            Some(
+                r#"{"model":"gpt-5.5","reasoning":{"effort":"xhigh"},"prompt_cache_key":"key-1"}"#,
+            ),
             None,
         );
         assert_eq!(parsed.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(parsed.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(parsed.prompt_cache_key.as_deref(), Some("key-1"));
         assert_eq!(parsed.input_tokens, None);
     }
 
@@ -654,6 +720,7 @@ CREATE TABLE upstream_requests (
         assert_eq!(parsed.total_tokens, Some(15));
         assert_eq!(parsed.cached_tokens, Some(4));
         assert_eq!(parsed.reasoning_tokens, Some(3));
+        assert_eq!(parsed.cache_write_tokens, Some(1));
     }
 
     #[test]

@@ -363,7 +363,8 @@ mod tests {
 
     #[tokio::test]
     async fn config_file_override_still_wins() {
-        let dir = std::env::temp_dir().join(format!("ai_proxy_cfg_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ai_proxy_cfg_override_{}", std::process::id()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let config_path = dir.join("override.json");
         tokio::fs::write(
@@ -382,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_config_file_keeps_defaults() {
-        let dir = std::env::temp_dir().join(format!("ai_proxy_cfg_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ai_proxy_cfg_missing_{}", std::process::id()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let config = load(&test_cli(&dir, dir.join("absent.json")))
             .await
